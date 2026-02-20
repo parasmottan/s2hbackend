@@ -85,6 +85,29 @@ const requestSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    /**
+     * Timestamp when seeker confirmed the helper.
+     */
+    confirmedAt: {
+      type: Date,
+      default: null,
+    },
+    /**
+     * End of the 5-minute cancellation/rejection window.
+     * After this time, neither seeker nor helper can cancel.
+     */
+    cancelWindowExpiresAt: {
+      type: Date,
+      default: null,
+    },
+    /**
+     * If helper rejected, the reason they provided.
+     */
+    rejectionReason: {
+      type: String,
+      default: null,
+      trim: true,
+    },
   },
   { timestamps: true }
 );

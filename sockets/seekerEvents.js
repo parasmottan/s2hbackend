@@ -194,9 +194,14 @@ module.exports = (socket, io) => {
         return;
       }
 
-      // ── Update status ─────────────────────────────────────────
+      // ── Update status + set cancel window ───────────────────────
+      const now = new Date();
+      const cancelWindowExpiresAt = new Date(now.getTime() + DEFAULTS.CANCEL_WINDOW_MS);
+
       helpRequest.status = REQUEST_STATUS.CONFIRMED;
-      helpRequest.timerStartedAt = new Date();
+      helpRequest.timerStartedAt = now;
+      helpRequest.confirmedAt = now;
+      helpRequest.cancelWindowExpiresAt = cancelWindowExpiresAt;
       await helpRequest.save();
 
       // ── Create private room ───────────────────────────────────
@@ -223,11 +228,34 @@ module.exports = (socket, io) => {
       helpRequest.status = REQUEST_STATUS.ON_THE_WAY;
       await helpRequest.save();
 
+      // ── Emit confirm_redirect to BOTH seeker and helper ───────
+      const redirectPayload = {
+        requestId,
+        cancelWindowExpiresAt: cancelWindowExpiresAt.toISOString(),
+        seekerLocation: helpRequest.seekerLocation,
+        helperLocation: helpRequest.helperLocation,
+      };
+
+      // To seeker (this socket)
+      socket.emit(SOCKET_EVENTS.CONFIRM_REDIRECT, redirectPayload);
+
+      // To helper
+      io.to(`user:${helpRequest.helperId.toString()}`).emit(SOCKET_EVENTS.CONFIRM_REDIRECT, redirectPayload);
+
       // ── Start arrival timer ───────────────────────────────────
       const durationMs = helpRequest.estimatedArrivalTime * 60 * 1000;
       startArrivalTimer(requestId, durationMs, io, privateRoom);
 
-      console.log(`✅ Request ${requestId} confirmed — helper en route, timer started`);
+      // ── Schedule cancel window expiry ──────────────────────────
+      setTimeout(() => {
+        io.to(privateRoom).emit(SOCKET_EVENTS.CANCEL_WINDOW_EXPIRED, {
+          requestId,
+          message: 'Cancellation window has expired. Request cannot be cancelled.',
+        });
+        console.log(`🔒 Cancel window expired for request ${requestId}`);
+      }, DEFAULTS.CANCEL_WINDOW_MS);
+
+      console.log(`✅ Request ${requestId} confirmed — helper en route, cancel window ${DEFAULTS.CANCEL_WINDOW_MS / 1000}s`);
     } catch (err) {
       console.error(`[SeekerEvents] confirm_helper error:`, err);
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
@@ -258,6 +286,14 @@ module.exports = (socket, io) => {
       ) {
         socket.emit(SOCKET_EVENTS.ERROR, {
           message: `Cannot cancel a ${helpRequest.status} request.`,
+        });
+        return;
+      }
+
+      // ── Cancel window guard ────────────────────────────────────
+      if (helpRequest.cancelWindowExpiresAt && new Date() > helpRequest.cancelWindowExpiresAt) {
+        socket.emit(SOCKET_EVENTS.ERROR, {
+          message: 'Cancellation window has expired. You can no longer cancel this request.',
         });
         return;
       }
