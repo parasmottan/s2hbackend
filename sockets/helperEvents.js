@@ -70,6 +70,7 @@ module.exports = (socket, io) => {
   socket.on(SOCKET_EVENTS.ACCEPT_REQUEST, async (data) => {
     try {
       const { requestId } = data;
+      console.log(`[HelperEvents] 🔐 Helper ${userId} attempting to ACCEPT request ${requestId}`);
 
       const updatedRequest = await Request.findOneAndUpdate(
         {
@@ -87,6 +88,7 @@ module.exports = (socket, io) => {
 
       // If null → another helper already locked it
       if (!updatedRequest) {
+        console.warn(`[HelperEvents] ❌ Race condition: Request ${requestId} already locked or not searchable.`);
         socket.emit(SOCKET_EVENTS.REQUEST_LOCKED, {
           requestId,
           message: 'Request is no longer available (already accepted by another helper).',
@@ -94,6 +96,8 @@ module.exports = (socket, io) => {
         });
         return;
       }
+
+      console.log(`[HelperEvents] 🔒 Request ${requestId} successfully LOCKED by helper ${userId}`);
 
       // Cancel the search expiry timer — a helper accepted
       clearSearchExpiry(requestId);
@@ -127,8 +131,6 @@ module.exports = (socket, io) => {
         message: 'You have successfully accepted the request. Waiting for seeker confirmation.',
         locked: false,
       });
-
-      console.log(`🔒 Request ${requestId} locked by helper ${userId}`);
     } catch (err) {
       console.error(`[HelperEvents] accept_request error:`, err);
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });

@@ -70,10 +70,11 @@ const initSocket = (server) => {
         const user = await User.findById(userId).select('currentLocation');
         const coords = user?.currentLocation?.coordinates || [0, 0];
 
+        // setOnline handles replacement of stale socket mapping for same helperId automatically
         onlineHelpers.setOnline(userId, socket.id, coords[0], coords[1]);
         await User.findByIdAndUpdate(userId, { isOnline: true });
 
-        console.log(`🟢 Helper ${userId} registered online`);
+        console.log(`🟢 Helper ${userId} registered online (Total: ${onlineHelpers.count()})`);
       } catch (err) {
         console.log("Helper auto-register error:", err.message);
       }

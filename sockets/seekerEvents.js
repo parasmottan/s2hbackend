@@ -24,48 +24,41 @@ module.exports = (socket, io) => {
   //   4. Emit to online helpers via in-memory map (NOT DB query)
   //   5. Start search expiry timer
   socket.on(SOCKET_EVENTS.SEARCH_HELP, async (data) => {
-    console.log(`[SeekerEvents] search_help from ${userId}:`, data);
+    console.log(`[SeekerEvents] 🔍 search_help RECEIVED from ${userId} (Socket: ${socket.id})`, data);
     try {
       const { category, budget, estimatedArrivalTime, longitude, latitude } = data;
 
-      // ── STEP 1: Cancel all previous active requests (override) ──
+      // ── STEP 1: Strict Search Guard (Cancel active requests) ─────
       const activeStatuses = [
         REQUEST_STATUS.SEARCHING,
         REQUEST_STATUS.HELPER_ACCEPTED,
         REQUEST_STATUS.CONFIRMED,
       ];
 
-      // Find active requests BEFORE cancelling (to notify helpers)
       const activeRequests = await Request.find({
         seekerId: userId,
         status: { $in: activeStatuses },
       }).select('_id helperId status');
 
       if (activeRequests.length > 0) {
-        // Atomic cancel all
+        // Atomic cancel all previous
         await Request.updateMany(
           { seekerId: userId, status: { $in: activeStatuses } },
           { status: REQUEST_STATUS.CANCELLED }
         );
 
-        // Notify each affected helper
         for (const req of activeRequests) {
-          // Clear any search expiry timer
           clearSearchExpiry(req._id.toString());
           clearArrivalTimer(req._id.toString());
 
           if (req.helperId) {
-            const helperSocketId = onlineHelpers.getSocketId(req.helperId.toString());
-            if (helperSocketId) {
-              io.to(`user:${req.helperId.toString()}`).emit(SOCKET_EVENTS.REQUEST_CANCELLED, {
-                requestId: req._id,
-                message: 'Seeker started a new search. Previous request cancelled.',
-              });
-            }
+            io.to(`user:${req.helperId.toString()}`).emit(SOCKET_EVENTS.REQUEST_CANCELLED, {
+              requestId: req._id,
+              message: 'Seeker started a new search. Previous request cancelled.',
+            });
           }
         }
-
-        console.log(`[SeekerEvents] Cancelled ${activeRequests.length} previous active request(s) for ${userId}`);
+        console.log(`[SeekerEvents] 🧹 Cleaned ${activeRequests.length} active requests for ${userId}`);
       }
 
       // ── STEP 2: Create new request ─────────────────────────────
@@ -85,18 +78,15 @@ module.exports = (socket, io) => {
         expiresAt,
       });
 
-      // ── STEP 3: Find eligible online helpers ───────────────────
-      // Primary: use in-memory map + optional geo filter
-      // The in-memory map is the source of truth for who is online.
-      const allOnlineIds = onlineHelpers.getAllOnlineIds();
+      console.log(`[SeekerEvents] 📝 Request CREATED: ${helpRequest._id} for seeker ${userId}`);
 
+      // ── STEP 3: Deduplicate Helpers ───────────────────────────
+      const allOnlineIds = onlineHelpers.getAllOnlineIds();
       let targetHelperIds = [];
 
       if (allOnlineIds.length > 0) {
-        // Try geo-filtered query first (only among actually-online helpers)
         try {
           const geoHelpers = await findNearbyHelpers(longitude, latitude);
-          // Filter to only those actually in our in-memory map
           targetHelperIds = geoHelpers
             .map((h) => h._id.toString())
             .filter((id) => onlineHelpers.isOnline(id));
@@ -104,15 +94,16 @@ module.exports = (socket, io) => {
           console.error(`[SeekerEvents] Geo query failed: ${geoErr.message}`);
         }
 
-        // Fallback: if geo returned nothing, use all online helpers
         if (targetHelperIds.length === 0) {
           targetHelperIds = allOnlineIds;
-          console.log(`[SeekerEvents] Geo fallback: using all ${targetHelperIds.length} online helpers`);
         }
       }
 
-      if (targetHelperIds.length === 0) {
-        // No helpers online at all — expire the request immediately
+      // 🔥 CRITICAL FIX: Deduplicate using a Set
+      const uniqueHelperIds = [...new Set(targetHelperIds)];
+      const uniqueSocketIds = new Set(); // Also track socket IDs to prevent double-emit to same connection
+
+      if (uniqueHelperIds.length === 0) {
         helpRequest.status = REQUEST_STATUS.EXPIRED;
         await helpRequest.save();
 
@@ -123,21 +114,19 @@ module.exports = (socket, io) => {
         return;
       }
 
-      // ── STEP 4: Emit new_request to each online helper ─────────
-      let notified = 0;
-      for (const helperId of targetHelperIds) {
+      // ── STEP 4: Emit new_request with deduplication ───────────
+      let notifiedCount = 0;
+      for (const helperId of uniqueHelperIds) {
         const socketId = onlineHelpers.getSocketId(helperId);
-        if (!socketId) continue;
+        if (!socketId || uniqueSocketIds.has(socketId)) continue;
 
-        // Verify socket is actually connected before emitting
         const helperSocket = io.sockets.sockets.get(socketId);
         if (!helperSocket) {
-          // Stale mapping — clean it up
           onlineHelpers.removeBySocketId(socketId);
-          console.log(`[SeekerEvents] Cleaned stale socket for helper ${helperId}`);
           continue;
         }
 
+        uniqueSocketIds.add(socketId);
         helperSocket.emit(SOCKET_EVENTS.NEW_REQUEST, {
           requestId: helpRequest._id,
           category,
@@ -145,21 +134,19 @@ module.exports = (socket, io) => {
           estimatedArrivalTime,
           seekerLocation: helpRequest.seekerLocation,
         });
-        notified++;
+        notifiedCount++;
       }
 
-      // ── STEP 5: Start search expiry timer ──────────────────────
       startSearchExpiry(helpRequest._id.toString(), DEFAULTS.SEARCH_EXPIRY_MS, io, userId);
 
-      // Acknowledge to seeker
       socket.emit('search_started', {
         requestId: helpRequest._id,
-        helpersNotified: notified,
+        helpersNotified: notifiedCount,
       });
 
-      console.log(`🔍 Seeker ${userId} searching — ${notified} helpers notified (expiry in ${DEFAULTS.SEARCH_EXPIRY_MS / 1000}s)`);
+      console.log(`[SeekerEvents] 📡 BROADCAST for ${helpRequest._id}: ${notifiedCount} helpers notified`);
     } catch (err) {
-      console.error(`[SeekerEvents] search_help error:`, err);
+      console.error(`[SeekerEvents] ❌ search_help error:`, err);
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
     }
   });
