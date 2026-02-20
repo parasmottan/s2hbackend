@@ -3,6 +3,7 @@ const {
   searchHelp,
   getRequestById,
   cancelRequest,
+  getMyRequests,
 } = require('../controllers/requestController');
 const { protect, authorize } = require('../middlewares/auth');
 const validate = require('../middlewares/validate');
@@ -11,6 +12,9 @@ const { searchLimiter } = require('../middlewares/rateLimiter');
 
 // All request routes are protected
 router.use(protect);
+
+// Get my request history (seeker or helper)
+router.get('/my', getMyRequests);
 
 // Seeker-only: create a search request (rate-limited)
 router.post(

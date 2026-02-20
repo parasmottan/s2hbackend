@@ -12,6 +12,7 @@ const REQUEST_STATUS = Object.freeze({
   ON_THE_WAY: 'on_the_way',
   COMPLETED: 'completed',
   CANCELLED: 'cancelled',
+  EXPIRED: 'expired',
 });
 
 // ── User roles ──────────────────────────────────────────────────
@@ -39,8 +40,10 @@ const SOCKET_EVENTS = Object.freeze({
   HELPER_FOUND: 'helper_found',
   REQUEST_LOCKED: 'request_locked',
   REQUEST_EXPIRED: 'request_expired',
+  REQUEST_CANCELLED: 'request_cancelled',
   HELPER_ON_THE_WAY: 'helper_on_the_way',
   ARRIVAL_TIMER_STARTED: 'arrival_timer_started',
+  SYNC_STATE: 'sync_state',
 
   // Generic
   ERROR: 'error',
@@ -51,7 +54,8 @@ const SOCKET_EVENTS = Object.freeze({
 // ── Defaults ────────────────────────────────────────────────────
 const DEFAULTS = Object.freeze({
   SEARCH_RADIUS_KM: Number(process.env.SEARCH_RADIUS_KM) || 10,
-  REQUEST_TIMEOUT_MS: Number(process.env.REQUEST_TIMEOUT_MS) || 300000, // 5 min
+  REQUEST_TIMEOUT_MS: Number(process.env.REQUEST_TIMEOUT_MS) || 300000, // 5 min arrival
+  SEARCH_EXPIRY_MS: Number(process.env.SEARCH_EXPIRY_MS) || 120000,    // 2 min search timeout
 });
 
 module.exports = { REQUEST_STATUS, ROLES, SOCKET_EVENTS, DEFAULTS };

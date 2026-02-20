@@ -2,38 +2,47 @@ const User = require('../models/User');
 const Request = require('../models/Request');
 const { REQUEST_STATUS, SOCKET_EVENTS } = require('../config/constants');
 const onlineHelpers = require('../utils/onlineHelpers');
+const { clearSearchExpiry } = require('../utils/timer');
 
 /**
  * Register helper-side socket events.
+ *
+ * NOTE: Disconnect cleanup is handled in sockets/index.js
+ * using removeBySocketId() — do NOT add a duplicate here.
  *
  * @param {import('socket.io').Socket} socket
  * @param {import('socket.io').Server} io
  */
 module.exports = (socket, io) => {
-  const userId = socket.userId; // set by auth middleware
+  const userId = socket.userId;
 
   // ── go_online ─────────────────────────────────────────────────
   socket.on(SOCKET_EVENTS.GO_ONLINE, async (data) => {
     try {
-      const { longitude, latitude } = data;
+      // Only helpers can go online
+      if (socket.userRole !== 'helper') {
+        socket.emit(SOCKET_EVENTS.ERROR, { message: 'Only helpers can go online.' });
+        return;
+      }
 
-      // Update DB
+      const { longitude, latitude } = data;
+      const lng = longitude || 0;
+      const lat = latitude || 0;
+
+      // Update DB — set isOnline + location
       await User.findByIdAndUpdate(userId, {
         isOnline: true,
-        ...(longitude != null &&
-          latitude != null && {
-          currentLocation: {
-            type: 'Point',
-            coordinates: [longitude, latitude],
-          },
-        }),
+        currentLocation: {
+          type: 'Point',
+          coordinates: [lng, lat],
+        },
       });
 
-      // Update in-memory map
-      onlineHelpers.setOnline(userId, socket.id);
+      // Update in-memory map with socketId + location
+      onlineHelpers.setOnline(userId, socket.id, lng, lat);
 
       socket.emit('status', { online: true });
-      console.log(`🟢 Helper ${userId} is online`);
+      console.log(`🟢 Helper ${userId} is online at [${lng}, ${lat}] (socket: ${socket.id})`);
     } catch (err) {
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
     }
@@ -46,22 +55,18 @@ module.exports = (socket, io) => {
       onlineHelpers.setOffline(userId);
 
       socket.emit('status', { online: false });
-      console.log(`🔴 Helper ${userId} is offline`);
+      console.log(`🔴 Helper ${userId} went offline`);
     } catch (err) {
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
     }
   });
 
   // ── accept_request ────────────────────────────────────────────
-  // CRITICAL: Atomic locking via findOneAndUpdate.
+  // ATOMIC LOCKING — only the first helper to match the filter wins.
   //
-  // The filter requires BOTH:
-  //   status === 'searching'   AND   lockedBy === null
-  //
-  // MongoDB guarantees that only ONE update will match because
-  // the first successful write changes both fields, so all
-  // subsequent attempts by other helpers will fail the filter.
-  // This eliminates race conditions without needing distributed locks.
+  // Filter: { _id, status: 'searching', lockedBy: null }
+  // MongoDB guarantees that only ONE concurrent update succeeds
+  // because the first write changes both fields.
   socket.on(SOCKET_EVENTS.ACCEPT_REQUEST, async (data) => {
     try {
       const { requestId } = data;
@@ -70,7 +75,7 @@ module.exports = (socket, io) => {
         {
           _id: requestId,
           status: REQUEST_STATUS.SEARCHING,
-          lockedBy: null, // ← race-condition guard
+          lockedBy: null,
         },
         {
           status: REQUEST_STATUS.HELPER_ACCEPTED,
@@ -82,22 +87,25 @@ module.exports = (socket, io) => {
 
       // If null → another helper already locked it
       if (!updatedRequest) {
-        socket.emit(SOCKET_EVENTS.ERROR, {
+        socket.emit(SOCKET_EVENTS.REQUEST_LOCKED, {
+          requestId,
           message: 'Request is no longer available (already accepted by another helper).',
+          locked: true,
         });
         return;
       }
 
-      // Retrieve helper info to send to the seeker
-      const helper = await User.findById(userId).select(
-        'name email rating currentLocation'
-      );
+      // Cancel the search expiry timer — a helper accepted
+      clearSearchExpiry(requestId);
+
+      // Get helper info to send to the seeker
+      const helper = await User.findById(userId).select('name email rating currentLocation');
 
       // Save helper's current location on the request
       updatedRequest.helperLocation = helper.currentLocation;
       await updatedRequest.save();
 
-      // Notify seeker that a helper has been found
+      // Notify seeker that a helper has accepted
       const seekerRoom = `user:${updatedRequest.seekerId.toString()}`;
 
       io.to(seekerRoom).emit(SOCKET_EVENTS.HELPER_FOUND, {
@@ -107,7 +115,9 @@ module.exports = (socket, io) => {
           name: helper.name,
           email: helper.email,
           rating: helper.rating,
-          location: helper.currentLocation,
+          currentLocation: helper.currentLocation,
+          longitude: helper.currentLocation?.coordinates?.[0],
+          latitude: helper.currentLocation?.coordinates?.[1],
         },
       });
 
@@ -115,18 +125,18 @@ module.exports = (socket, io) => {
       socket.emit(SOCKET_EVENTS.REQUEST_LOCKED, {
         requestId,
         message: 'You have successfully accepted the request. Waiting for seeker confirmation.',
+        locked: false,
       });
 
       console.log(`🔒 Request ${requestId} locked by helper ${userId}`);
     } catch (err) {
+      console.error(`[HelperEvents] accept_request error:`, err);
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
     }
   });
 
   // ── reject_request ────────────────────────────────────────────
   socket.on(SOCKET_EVENTS.REJECT_REQUEST, (data) => {
-    // Simple acknowledgement — no state changes needed.
-    // The request remains in 'searching' status for others.
     socket.emit('request_rejected_ack', {
       requestId: data.requestId,
       message: 'You have rejected this request.',
@@ -135,12 +145,13 @@ module.exports = (socket, io) => {
 
   // ── location_update ───────────────────────────────────────────
   // Helper periodically sends their updated position.
-  // Forward it to the seeker via the private request room.
+  // Updates both DB and in-memory map, then forwards to the
+  // private request room so the seeker sees live position.
   socket.on(SOCKET_EVENTS.LOCATION_UPDATE, async (data) => {
     try {
       const { requestId, longitude, latitude } = data;
 
-      // Persist in DB
+      // Update DB
       await User.findByIdAndUpdate(userId, {
         currentLocation: {
           type: 'Point',
@@ -148,27 +159,24 @@ module.exports = (socket, io) => {
         },
       });
 
+      // Update in-memory map (keeps map coordinates fresh)
+      onlineHelpers.updateLocation(userId, longitude, latitude);
+
       // Forward to private room so the seeker sees live position
-      const roomName = `request:${requestId}`;
-      io.to(roomName).emit(SOCKET_EVENTS.LOCATION_UPDATE, {
-        helperId: userId,
-        location: { type: 'Point', coordinates: [longitude, latitude] },
-        updatedAt: new Date().toISOString(),
-      });
+      if (requestId) {
+        const roomName = `request:${requestId}`;
+        io.to(roomName).emit(SOCKET_EVENTS.LOCATION_UPDATE, {
+          helperId: userId,
+          longitude,
+          latitude,
+          location: { type: 'Point', coordinates: [longitude, latitude] },
+          updatedAt: new Date().toISOString(),
+        });
+      }
     } catch (err) {
       socket.emit(SOCKET_EVENTS.ERROR, { message: err.message });
     }
   });
 
-  // ── disconnect ────────────────────────────────────────────────
-  socket.on(SOCKET_EVENTS.DISCONNECT, async () => {
-    try {
-      // Mark offline in both DB and memory
-      await User.findByIdAndUpdate(userId, { isOnline: false });
-      onlineHelpers.setOffline(userId);
-      console.log(`🔴 Helper ${userId} disconnected`);
-    } catch (err) {
-      console.error('Disconnect cleanup error:', err.message);
-    }
-  });
+  // NOTE: disconnect handler is in sockets/index.js (single source of truth)
 };

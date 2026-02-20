@@ -77,6 +77,14 @@ const requestSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    /**
+     * When the request should auto-expire if still in 'searching' status.
+     * Set on creation to `now + SEARCH_EXPIRY_MS`.
+     */
+    expiresAt: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true }
 );
@@ -85,5 +93,6 @@ const requestSchema = new mongoose.Schema(
 requestSchema.index({ seekerLocation: '2dsphere' });
 requestSchema.index({ seekerId: 1, status: 1 });
 requestSchema.index({ helperId: 1, status: 1 });
+requestSchema.index({ expiresAt: 1 }); // for expiry queries
 
 module.exports = mongoose.model('Request', requestSchema);
