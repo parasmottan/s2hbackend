@@ -6,36 +6,29 @@ const onlineHelpers = require('../utils/onlineHelpers');
 const User = require('../models/User');
 const Request = require('../models/Request');
 
-/**
- * Initialise Socket.io on the given HTTP server.
- *
- * Responsibilities:
- *   1. JWT authentication middleware for every socket connection
- *   2. Join each user to a personal room `user:<id>`
- *   3. Auto-register helpers in onlineHelpers map on connect
- *   4. Push sync_state to reconnecting users
- *   5. Delegate to role-specific event handlers
- *   6. Clean up stale socket mappings on disconnect
- *
- * @param {import('http').Server} server
- * @returns {import('socket.io').Server}
- */
 const initSocket = (server) => {
   const { Server } = require('socket.io');
 
   const io = new Server(server, {
     cors: {
-      origin: '*', // tighten in production
+      origin: process.env.FRONTEND_URL || "*", // SET FRONTEND_URL in production
       methods: ['GET', 'POST'],
+      credentials: true
     },
-    pingInterval: 10000,
-    pingTimeout: 5000,
+    transports: ["websocket", "polling"],
+    pingInterval: 25000,
+    pingTimeout: 20000,
+  });
+
+  // 🔥 Debug low-level engine errors
+  io.engine.on("connection_error", (err) => {
+    console.log("❌ Engine connection error:", err.message);
   });
 
   // ── Socket authentication middleware ──────────────────────────
   io.use(async (socket, next) => {
     try {
-      const token = socket.handshake.auth.token;
+      const token = socket.handshake.auth?.token;
 
       if (!token) {
         return next(new Error('Authentication error — no token provided'));
@@ -52,43 +45,41 @@ const initSocket = (server) => {
         return next(new Error('Authentication error — user not found'));
       }
 
-      // Attach to socket for downstream handlers
       socket.userId = decoded.id;
       socket.userRole = user.role;
       socket.userName = user.name;
 
       next();
     } catch (err) {
+      console.log("❌ Socket auth failed:", err.message);
       next(new Error('Authentication error — invalid token'));
     }
   });
 
   // ── Connection handler ────────────────────────────────────────
-  io.on(SOCKET_EVENTS.CONNECTION, async (socket) => {
+  io.on('connection', async (socket) => {
     const { userId, userRole } = socket;
 
     console.log(`⚡ Socket connected: ${userId} (${userRole}) — ${socket.id}`);
 
-    // Join personal room for targeted server → client messages
-    const roomName = `user:${userId}`;
-    socket.join(roomName);
+    socket.join(`user:${userId}`);
 
-    // ── Auto-register helper in onlineHelpers map ───────────────
-    // This ensures reconnecting helpers get a fresh socketId mapping
-    // immediately, fixing stale socket bugs.
+    // ── Auto-register helper ───────────────────────────────
     if (userRole === 'helper') {
-      const user = await User.findById(userId).select('currentLocation');
-      const coords = user?.currentLocation?.coordinates || [0, 0];
-      onlineHelpers.setOnline(userId, socket.id, coords[0], coords[1]);
+      try {
+        const user = await User.findById(userId).select('currentLocation');
+        const coords = user?.currentLocation?.coordinates || [0, 0];
 
-      // Sync DB isOnline flag
-      await User.findByIdAndUpdate(userId, { isOnline: true });
-      console.log(`🟢 Helper ${userId} auto-registered in onlineHelpers map (reconnect-safe)`);
+        onlineHelpers.setOnline(userId, socket.id, coords[0], coords[1]);
+        await User.findByIdAndUpdate(userId, { isOnline: true });
+
+        console.log(`🟢 Helper ${userId} registered online`);
+      } catch (err) {
+        console.log("Helper auto-register error:", err.message);
+      }
     }
 
-    // ── Sync state for reconnecting users ───────────────────────
-    // Push the latest active request status so the client knows
-    // where to resume (fixes inconsistent reconnect behavior).
+    // ── Sync state ─────────────────────────────────────────
     try {
       const activeStatuses = [
         REQUEST_STATUS.SEARCHING,
@@ -100,9 +91,10 @@ const initSocket = (server) => {
       let activeRequest = null;
 
       if (userRole === 'seeker' || userRole === 'helper') {
-        const filter = userRole === 'seeker'
-          ? { seekerId: userId, status: { $in: activeStatuses } }
-          : { helperId: userId, status: { $in: activeStatuses } };
+        const filter =
+          userRole === 'seeker'
+            ? { seekerId: userId, status: { $in: activeStatuses } }
+            : { helperId: userId, status: { $in: activeStatuses } };
 
         activeRequest = await Request.findOne(filter)
           .sort({ createdAt: -1 })
@@ -112,30 +104,28 @@ const initSocket = (server) => {
 
       socket.emit(SOCKET_EVENTS.SYNC_STATE, {
         activeRequest: activeRequest || null,
-        onlineHelpers: userRole === 'helper' ? onlineHelpers.count() : undefined,
+        onlineHelpers:
+          userRole === 'helper' ? onlineHelpers.count() : undefined,
       });
 
-      console.log(`[Sync] Sent sync_state to ${userId}: ${activeRequest ? activeRequest.status : 'no active request'}`);
+      console.log(`[Sync] Sent to ${userId}`);
     } catch (err) {
-      console.error(`[Sync] Error syncing state for ${userId}:`, err.message);
+      console.error(`[Sync] Error:`, err.message);
     }
 
-    // Register event handlers (role-agnostic — both register, guards inside)
     registerHelperEvents(socket, io);
     registerSeekerEvents(socket, io);
 
-    // ── Disconnect cleanup ──────────────────────────────────────
-    socket.on(SOCKET_EVENTS.DISCONNECT, async () => {
-      console.log(`💤 Socket disconnected: ${userId} (${userRole}) — ${socket.id}`);
+    // ── Disconnect cleanup ─────────────────────────────────
+    socket.on('disconnect', async (reason) => {
+      console.log(`🔴 Socket disconnected: ${userId} — ${reason}`);
 
-      // Clean up helper from in-memory map using socketId
-      // This handles the case correctly even if the same helper
-      // reconnected on a different socket before this fires.
       if (userRole === 'helper') {
         const removedId = onlineHelpers.removeBySocketId(socket.id);
+
         if (removedId) {
           await User.findByIdAndUpdate(removedId, { isOnline: false });
-          console.log(`🔴 Helper ${removedId} removed from onlineHelpers (socket ${socket.id})`);
+          console.log(`Helper ${removedId} removed from map`);
         }
       }
     });
